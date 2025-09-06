@@ -45,7 +45,7 @@ router.post(
 
       // Generate OTP
       const otp = generateOtp()
-      const otpExpires = new Date(Date.now() + 10 * 60 * 1000) // 10 minutes
+      const otpExpires = new Date(Date.now() + 2 * 60 * 1000) // 2 minutes
 
       // Create user (inactive)
       const user = new User({
@@ -70,6 +70,66 @@ router.post(
       })
     } catch (error) {
       console.error("Registration error:", error)
+      res.status(500).json({
+        success: false,
+        message: "Internal server error",
+      })
+    }
+  },
+)
+
+// Resend OTP
+router.post(
+  "/resend-otp",
+  [
+    body("email").isEmail().withMessage("Please provide a valid email"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req)
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          success: false,
+          message: "Validation errors",
+          errors: errors.array(),
+        })
+      }
+
+      const { email } = req.body
+
+      const user = await User.findOne({ email })
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        })
+      }
+
+      if (user.isActive) {
+        return res.status(400).json({
+          success: false,
+          message: "User is already verified",
+        })
+      }
+
+      // Generate new OTP
+      const otp = generateOtp()
+      const otpExpires = new Date(Date.now() + 2 * 60 * 1000) // 2 minutes
+
+      // Update user with new OTP
+      user.otp = otp
+      user.otpExpires = otpExpires
+      await user.save()
+
+      // Send OTP email
+      await sendOtpEmail(email, otp)
+
+      res.json({
+        success: true,
+        message: "New OTP sent successfully",
+      })
+    } catch (error) {
+      console.error("Resend OTP error:", error)
       res.status(500).json({
         success: false,
         message: "Internal server error",
