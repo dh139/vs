@@ -138,12 +138,11 @@ router.post(
   },
 )
 
-// Verify OTP
+// Forgot Password
 router.post(
-  "/verify-otp",
+  "/forgot-password",
   [
     body("email").isEmail().withMessage("Please provide a valid email"),
-    body("otp").isLength({ min: 6, max: 6 }).withMessage("OTP must be 6 digits"),
   ],
   async (req, res) => {
     try {
@@ -156,7 +155,7 @@ router.post(
         })
       }
 
-      const { email, otp } = req.body
+      const { email } = req.body
 
       const user = await User.findOne({ email })
       if (!user) {
@@ -166,35 +165,184 @@ router.post(
         })
       }
 
-      if (user.otp !== otp || user.otpExpires < new Date()) {
+      if (!user.isActive) {
         return res.status(400).json({
           success: false,
-          message: "Invalid or expired OTP",
+          message: "Account not activated. Please verify your email.",
         })
       }
 
-      // Activate user
-      user.isActive = true
-      user.otp = null
-      user.otpExpires = null
+      // Generate new OTP for password reset
+      const resetPasswordOtp = generateOtp()
+      const resetPasswordOtpExpires = new Date(Date.now() + 2 * 60 * 1000) // 2 minutes
+
+      // Update user with new OTP
+      user.resetPasswordOtp = resetPasswordOtp
+      user.resetPasswordOtpExpires = resetPasswordOtpExpires
       await user.save()
 
-      // Generate JWT token
-      const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || "your-secret-key", { expiresIn: "7d" })
+      // Send OTP email
+      await sendOtpEmail(email, resetPasswordOtp)
 
       res.json({
         success: true,
-        message: "OTP verified successfully",
-        token,
-        user: {
-          id: user._id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-        },
+        message: "OTP sent successfully for password reset",
       })
     } catch (error) {
+      console.error("Forgot password error:", error)
+      res.status(500).json({
+        success: false,
+        message: "Internal server error",
+      })
+    }
+  },
+)
+
+// Verify OTP
+router.post(
+  "/verify-otp",
+  [
+    body("email").isEmail().withMessage("Please provide a valid email"),
+    body("otp").isLength({ min: 6, max: 6 }).withMessage("OTP must be 6 digits"),
+    body("purpose")
+      .optional()
+      .isIn(['registration', 'reset-password'])
+      .withMessage("Invalid purpose"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req)
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          success: false,
+          message: "Validation errors",
+          errors: errors.array(),
+        })
+      }
+
+      const { email, otp, purpose = 'registration' } = req.body
+
+      const user = await User.findOne({ email })
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        })
+      }
+
+      if (purpose === 'registration') {
+        if (user.otp !== otp || user.otpExpires < new Date()) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid or expired OTP",
+          })
+        }
+
+        // Activate user
+        user.isActive = true
+        user.otp = null
+        user.otpExpires = null
+        await user.save()
+
+        // Generate JWT token
+        const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || "your-secret-key", { expiresIn: "7d" })
+
+        res.json({
+          success: true,
+          message: "OTP verified successfully",
+          token,
+          user: {
+            id: user._id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+          },
+        })
+      } else if (purpose === 'reset-password') {
+        if (user.resetPasswordOtp !== otp || user.resetPasswordOtpExpires < new Date()) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid or expired OTP",
+          })
+        }
+
+        // Generate JWT token for password reset
+        const token = jwt.sign({ userId: user._id, purpose: 'reset-password' }, process.env.JWT_SECRET || "your-secret-key", { expiresIn: "1h" })
+
+        res.json({
+          success: true,
+          message: "OTP verified successfully for password reset",
+          token,
+        })
+      }
+    } catch (error) {
       console.error("OTP verification error:", error)
+      res.status(500).json({
+        success: false,
+        message: "Internal server error",
+      })
+    }
+  },
+)
+
+// Reset Password
+router.post(
+  "/reset-password",
+  [
+    body("email").isEmail().withMessage("Please provide a valid email"),
+    body("password").isLength({ min: 6 }).withMessage("Password must be at least 6 characters"),
+    body("token").notEmpty().withMessage("Token is required"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req)
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          success: false,
+          message: "Validation errors",
+          errors: errors.array(),
+        })
+      }
+
+      const { email, password, token } = req.body
+
+      // Verify token
+      let decoded
+      try {
+        decoded = jwt.verify(token, process.env.JWT_SECRET || "your-secret-key")
+        if (decoded.purpose !== 'reset-password') {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid token purpose",
+          })
+        }
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid or expired token",
+        })
+      }
+
+      const user = await User.findOne({ email })
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        })
+      }
+
+      // Update password
+      user.password = password
+      user.resetPasswordOtp = null
+      user.resetPasswordOtpExpires = null
+      await user.save()
+
+      res.json({
+        success: true,
+        message: "Password reset successfully",
+      })
+    } catch (error) {
+      console.error("Reset password error:", error)
       res.status(500).json({
         success: false,
         message: "Internal server error",
@@ -290,7 +438,7 @@ router.get("/profile", authenticateToken, async (req, res) => {
     console.log("[v0] User ID from token:", req.user._id)
     console.log("[v0] User from middleware:", JSON.stringify(req.user, null, 2))
 
-    const user = await User.findById(req.user._id).select("-password -otp -otpExpires")
+    const user = await User.findById(req.user._id).select("-password -otp -otpExpires -resetPasswordOtp -resetPasswordOtpExpires")
 
     if (!user) {
       console.log("[v0] User not found in database")
@@ -328,4 +476,4 @@ router.get("/profile", authenticateToken, async (req, res) => {
   }
 })
 
-module.exports = router
+module.exports = router 
