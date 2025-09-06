@@ -13,24 +13,12 @@ cloudinary.config({
 
 const storage = multer.memoryStorage();
 
-const fileFilter = async (req, file, cb) => {
+const fileFilter = (req, file, cb) => {
   console.log("[v0] FileFilter - Processing file:", file.originalname, "Mimetype:", file.mimetype);
 
   const allowedTypes = /jpeg|jpg|png|gif/;
   const extname = allowedTypes.test(file.originalname.toLowerCase());
-  let mimetype = file.mimetype.startsWith("image/");
-
-  // If MIME type is application/octet-stream, validate file content
-  if (file.mimetype === "application/octet-stream") {
-    try {
-      const fileType = await fileTypeFromBuffer(file.buffer);
-      mimetype = fileType && ["image/jpeg", "image/png", "image/gif"].includes(fileType.mime);
-      console.log("[v0] FileFilter - Content-based MIME check:", fileType ? fileType.mime : "unknown");
-    } catch (error) {
-      console.log("[v0] FileFilter - Error checking file type:", error);
-      mimetype = false;
-    }
-  }
+  const mimetype = file.mimetype.startsWith("image/") || file.mimetype === "application/octet-stream";
 
   console.log("[v0] FileFilter - Extension check:", extname, "Mimetype check:", mimetype);
 
@@ -48,40 +36,6 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
   fileFilter: fileFilter,
 });
-
-// Wrapper middleware to handle async fileFilter
-const asyncFileFilter = (req, res, next) => {
-  console.log("[v0] Multer middleware - Processing request");
-
-  upload.single("profilePhoto")(req, res, async (err) => {
-    if (err) {
-      console.log("[v0] Multer error:", err.message);
-      if (err instanceof multer.MulterError) {
-        if (err.code === "LIMIT_FILE_SIZE") {
-          return res.status(400).json({
-            success: false,
-            message: "File too large. Maximum size is 5MB",
-          });
-        }
-      }
-      return res.status(400).json({
-        success: false,
-        message: err.message,
-      });
-    }
-
-    console.log("[v0] Multer success - File processed:", !!req.file);
-    if (req.file) {
-      console.log("[v0] File details:", {
-        originalname: req.file.originalname,
-        mimetype: req.file.mimetype,
-        size: req.file.size,
-      });
-    }
-
-    next();
-  });
-};
 
 const router = express.Router();
 
@@ -129,7 +83,7 @@ router.put("/profile", authenticateToken, async (req, res) => {
   }
 });
 
-router.post("/profile/photo", authenticateToken, asyncFileFilter, async (req, res) => {
+router.post("/profile/photo", authenticateToken, upload.single("profilePhoto"), async (req, res) => {
   try {
     const userId = req.user._id;
 
@@ -140,6 +94,33 @@ router.post("/profile/photo", authenticateToken, asyncFileFilter, async (req, re
         success: false,
         message: "No image file provided",
       });
+    }
+
+    console.log("[v0] File details:", {
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+    });
+
+    // Validate file content if MIME type is application/octet-stream
+    if (req.file.mimetype === "application/octet-stream") {
+      try {
+        const fileType = await fileTypeFromBuffer(req.file.buffer);
+        if (!fileType || !["image/jpeg", "image/png", "image/gif"].includes(fileType.mime)) {
+          console.log("[v0] Content validation failed - Invalid file type:", fileType ? fileType.mime : "unknown");
+          return res.status(400).json({
+            success: false,
+            message: "Invalid file content. Only JPEG, JPG, PNG, and GIF are allowed.",
+          });
+        }
+        console.log("[v0] Content-based MIME check:", fileType.mime);
+      } catch (error) {
+        console.log("[v0] Error checking file type:", error);
+        return res.status(400).json({
+          success: false,
+          message: "Error validating file content. Only JPEG, JPG, PNG, and GIF are allowed.",
+        });
+      }
     }
 
     const user = await User.findById(userId);
