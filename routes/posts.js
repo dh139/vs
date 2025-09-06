@@ -1,31 +1,19 @@
 const express = require("express")
+const cloudinary = require("cloudinary").v2
 const multer = require("multer")
-const path = require("path")
-const fs = require("fs") // Added fs module to create uploads directory
 const { body, validationResult } = require("express-validator")
 const Post = require("../models/Post")
 const { authenticateToken, requireAdmin } = require("../middleware/auth")
 
 const router = express.Router()
 
-const uploadsDir = "uploads"
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true })
-  console.log("Created uploads directory")
-}
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "uploads/")
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9)
-    const filename = file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname)
-    console.log("[v0] Saving file as:", filename) // Added debug logging
-    cb(null, filename)
-  },
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 })
+
+const storage = multer.memoryStorage()
 
 const upload = multer({
   storage: storage,
@@ -33,18 +21,14 @@ const upload = multer({
     fileSize: 5 * 1024 * 1024, // 5MB limit
   },
   fileFilter: (req, file, cb) => {
-    console.log("[v0] File received:", file.originalname, "Type:", file.mimetype) // Added debug logging
-
     const isImageMimeType = file.mimetype.startsWith("image/")
     const imageExtensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
     const hasImageExtension = imageExtensions.some((ext) => file.originalname.toLowerCase().endsWith(ext))
 
     if (isImageMimeType || (file.mimetype === "application/octet-stream" && hasImageExtension)) {
-      console.log("[v0] File accepted as image") // Added debug logging
       cb(null, true)
     } else {
-      console.log("[v0] File rejected - not an image") // Added debug logging
-      cb(null, false) // Reject file gracefully instead of throwing error
+      cb(null, false)
     }
   },
 })
@@ -59,7 +43,7 @@ router.get("/", authenticateToken, async (req, res) => {
       posts: posts.map((post) => ({
         _id: post._id,
         caption: post.caption,
-        image: post.image ? `${req.protocol}://${req.get("host")}/uploads/${post.image}` : null,
+        image: post.image, // Return Cloudinary URL directly instead of constructing local URL
         createdAt: post.createdAt,
         feedbacks: post.feedbacks,
       })),
@@ -82,10 +66,6 @@ router.post(
   [body("caption").trim().notEmpty().withMessage("Caption is required")],
   async (req, res) => {
     try {
-      console.log("[v0] Create post request received") // Added debug logging
-      console.log("[v0] Request file:", req.file) // Added debug logging
-      console.log("[v0] Request body:", req.body) // Added debug logging
-
       const errors = validationResult(req)
       if (!errors.isEmpty()) {
         return res.status(400).json({
@@ -96,9 +76,26 @@ router.post(
       }
 
       const { caption } = req.body
-      const image = req.file ? req.file.filename : null
+      let imageUrl = null
 
-      console.log("[v0] Image filename:", image) // Added debug logging
+      if (req.file) {
+        const uploadResult = await new Promise((resolve, reject) => {
+          cloudinary.uploader
+            .upload_stream(
+              {
+                resource_type: "image",
+                folder: "posts",
+                transformation: [{ width: 800, height: 600, crop: "limit" }, { quality: "auto" }, { format: "auto" }],
+              },
+              (error, result) => {
+                if (error) reject(error)
+                else resolve(result)
+              },
+            )
+            .end(req.file.buffer)
+        })
+        imageUrl = uploadResult.secure_url
+      }
 
       if (!req.file && req.body.image) {
         return res.status(400).json({
@@ -109,12 +106,11 @@ router.post(
 
       const post = new Post({
         caption,
-        image,
+        image: imageUrl, // Store Cloudinary URL instead of filename
         createdBy: req.user._id,
       })
 
       await post.save()
-      console.log("[v0] Post saved to database:", post._id) // Added debug logging
 
       // Emit notification to all connected users
       const io = req.app.get("io")
@@ -123,16 +119,13 @@ router.post(
         postId: post._id,
       })
 
-      const imageUrl = post.image ? `${req.protocol}://${req.get("host")}/uploads/${post.image}` : null
-      console.log("[v0] Image URL:", imageUrl) // Added debug logging
-
       res.status(201).json({
         success: true,
         message: "Post created successfully",
         post: {
           _id: post._id,
           caption: post.caption,
-          image: imageUrl,
+          image: post.image, // Return Cloudinary URL directly
           createdAt: post.createdAt,
         },
       })
@@ -202,13 +195,25 @@ router.delete("/:id", authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params
 
-    const post = await Post.findByIdAndDelete(id)
+    const post = await Post.findById(id)
     if (!post) {
       return res.status(404).json({
         success: false,
         message: "Post not found",
       })
     }
+
+    if (post.image) {
+      try {
+        // Extract public_id from the URL
+        const publicId = post.image.split("/").pop().split(".")[0]
+        await cloudinary.uploader.destroy(`posts/${publicId}`)
+      } catch (error) {
+        console.log("Error deleting image from Cloudinary:", error)
+      }
+    }
+
+    await Post.findByIdAndDelete(id)
 
     res.json({
       success: true,

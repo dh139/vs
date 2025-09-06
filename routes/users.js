@@ -1,28 +1,21 @@
 const express = require("express")
 const User = require("../models/User")
 const { authenticateToken, requireAdmin } = require("../middleware/auth")
+const cloudinary = require("cloudinary").v2
 const multer = require("multer")
-const path = require("path")
-const fs = require("fs")
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = "uploads/profiles"
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true })
-    }
-    cb(null, uploadDir)
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9)
-    cb(null, "profile-" + uniqueSuffix + path.extname(file.originalname))
-  },
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 })
+
+const storage = multer.memoryStorage()
 
 const fileFilter = (req, file, cb) => {
   const allowedTypes = /jpeg|jpg|png|gif/
-  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase())
-  const mimetype = file.mimetype.startsWith("image/") || file.mimetype === "application/octet-stream"
+  const extname = allowedTypes.test(file.originalname.toLowerCase())
+  const mimetype = file.mimetype.startsWith("image/")
 
   if (mimetype && extname) {
     return cb(null, true)
@@ -102,24 +95,40 @@ router.post("/profile/photo", authenticateToken, upload.single("profilePhoto"), 
       })
     }
 
-    // Delete old profile photo if exists
     if (user.profilePicture) {
-      const oldPhotoPath = path.join(__dirname, "..", user.profilePicture)
-      if (fs.existsSync(oldPhotoPath)) {
-        fs.unlinkSync(oldPhotoPath)
+      try {
+        // Extract public_id from the URL
+        const publicId = user.profilePicture.split("/").pop().split(".")[0]
+        await cloudinary.uploader.destroy(`profiles/${publicId}`)
+      } catch (error) {
+        console.log("Error deleting old image:", error)
       }
     }
 
-    // Update user with new profile photo path
-    const newProfilePhotoPath = `uploads/profiles/${req.file.filename}`
-    user.profilePicture = newProfilePhotoPath
+    const uploadResult = await new Promise((resolve, reject) => {
+      cloudinary.uploader
+        .upload_stream(
+          {
+            resource_type: "image",
+            folder: "profiles",
+            transformation: [{ width: 400, height: 400, crop: "fill" }, { quality: "auto" }, { format: "auto" }],
+          },
+          (error, result) => {
+            if (error) reject(error)
+            else resolve(result)
+          },
+        )
+        .end(req.file.buffer)
+    })
+
+    user.profilePicture = uploadResult.secure_url
     await user.save()
 
     res.json({
       success: true,
       message: "Profile photo updated successfully",
       profilePhoto: user.profilePicture,
-      profilePhotoUrl: `${req.protocol}://${req.get("host")}/${user.profilePicture}`,
+      profilePhotoUrl: user.profilePicture,
     })
   } catch (error) {
     console.error("Update profile photo error:", error)
